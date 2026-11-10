@@ -1,0 +1,85 @@
+name: Binary Quant Lab - Six Major Forex Pairs (reference research)
+
+on:
+  workflow_dispatch:
+    inputs:
+      day:
+        description: "Historical UTC date (YYYY-MM-DD); not today"
+        required: true
+        default: "2026-10-01"
+        type: string
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/forex-six-majors.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  forex-reference-six:
+    name: "FX ${{ matrix.symbol }} Bid/Ask research"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        symbol: [EURUSD, GBPUSD, USDJPY, USDCHF, USDCAD, AUDUSD]
+    env:
+      SYMBOL: "${{ matrix.symbol }}"
+      FX_DAY: "${{ inputs.day || '2026-10-01' }}"
+    steps:
+      - name: Checkout research repository
+        uses: actions/checkout@v4
+      - name: Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Recover existing public research package
+        shell: bash
+        run: |
+          set -euo pipefail
+          unzip -q Binary_Quant_Lab_GitHub_Actions_Ready.zip -d project
+          test -f project/requirements.txt
+      - name: Install audited FX6 Python source and regression tests
+        shell: bash
+        run: |
+          python - <<'PY'
+          # Single-file bootstrap for phone upload. Decompressed modules are hash-checked.
+          from pathlib import Path
+          import base64, hashlib, zlib
+          modules = {
+              'src/fx6_research.py': ('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', '309feecbfa198ee59b807fe755868b225d88e85662da23af7279d51bc1aaebc1'),
+              'tests/test_fx6_research.py': ('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', '85ce6c785ede9ee03f08c7658bf47def1ba63af14ac9e967177c995c73ebc4f6'),
+              'tests/test_binance_history_strategies.py': ('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', 'e7fd5334252b337d446139889edbe50169973bb223444f4b327e9500f7e95752'),
+          }
+          for name, (payload, expected_sha) in modules.items():
+              raw = zlib.decompress(base64.b64decode(payload))
+              assert hashlib.sha256(raw).hexdigest() == expected_sha, name
+              target = Path("project") / name
+              target.parent.mkdir(parents=True, exist_ok=True)
+              target.write_bytes(raw)
+              print("Verified:", name)
+          PY
+      - name: Install research test dependencies
+        run: python -m pip install -r project/requirements.txt
+      - name: Execute tests including six-pair price scaling and causality
+        working-directory: project
+        run: python -m pytest -q
+      - name: Download independent FX reference quotes and simulate 300-second proxies
+        working-directory: project
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m src.fx6_research --symbol "$SYMBOL" --day "$FX_DAY" --out outputs/fx6 --rights-note "Research requested; review provider data-use terms"
+      - name: Upload derived research report only (no raw provider ticks)
+        uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: "fx6-${{ matrix.symbol }}-${{ github.run_id }}"
+          path: |
+            project/outputs/fx6/${{ matrix.symbol }}/*/manifest.json
+            project/outputs/fx6/${{ matrix.symbol }}/*/split_results.csv
+          retention-days: 7
+          if-no-files-found: error
