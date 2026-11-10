@@ -1,0 +1,49 @@
+name: Binary Quant Lab - Binance research
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/binance-research.yml'
+      - 'Binary_Quant_Lab_GitHub_Actions_Ready.zip'
+  schedule:
+    - cron: '18 6 * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  public-data-and-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Unpack research project from repository ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          unzip -q Binary_Quant_Lab_GitHub_Actions_Ready.zip -d project
+          test -f project/requirements.txt
+          test -f project/src/binance_public.py
+      - name: Install research dependencies
+        run: python -m pip install -r project/requirements.txt
+      - name: Test research code
+        working-directory: project
+        run: python -m pytest -q
+      - name: Download recent closed Binance M1 candles
+        working-directory: project
+        run: python -m src.binance_public --symbol BTCUSDT --minutes 720 --out outputs/binance
+      - name: Upload market-data audit artifacts
+        uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: binance-public-m1-${{ github.run_id }}
+          path: project/outputs/binance/
+          if-no-files-found: error
+          retention-days: 7
