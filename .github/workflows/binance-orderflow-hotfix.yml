@@ -1,0 +1,120 @@
+name: Binary Quant Lab - Order Flow v0.8.1 timestamp fix
+
+on:
+  workflow_dispatch:
+    inputs:
+      symbol:
+        description: Binance Spot pair
+        type: string
+        required: true
+        default: LTCUSDT
+      day:
+        description: UTC day, YYYY-MM-DD
+        type: string
+        required: true
+        default: '2026-10-01'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/binance-orderflow-hotfix.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  orderflow-research:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      SYMBOL: ${{ inputs.symbol || 'LTCUSDT' }}
+      DAY: ${{ inputs.day || '2026-10-01' }}
+    steps:
+      - name: Checkout research repository
+        uses: actions/checkout@v4
+      - name: Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Recover and SHA256-verify existing v0.8 sources; fix mixed ISO8601 timestamps
+        shell: bash
+        run: |
+          set -euo pipefail
+          unzip -q Binary_Quant_Lab_GitHub_Actions_Ready.zip -d project
+          python - <<'PYTHON'
+          import ast, base64, hashlib, re, zlib
+          from pathlib import Path
+          source=Path('.github/workflows/binance-orderflow.yml').read_text(encoding='utf-8')
+          pattern=r'^\s*(payloads|expected_sha256) = (\{.*?^\s*\})'
+          sections=re.findall(pattern,source,re.M|re.S)
+          assert [n for n,_ in sections]==['payloads','expected_sha256'], 'Original workflow source sections missing'
+          data={n:ast.literal_eval(s) for n,s in sections}
+          for filename,encoded in data['payloads'].items():
+              payload=zlib.decompress(base64.b64decode(encoded))
+              assert hashlib.sha256(payload).hexdigest()==data['expected_sha256'][filename],filename
+              target=Path('project')/filename
+              target.parent.mkdir(parents=True,exist_ok=True)
+              target.write_bytes(payload)
+              print('SHA256 verified',filename)
+          src=Path('project/src/order_flow.py')
+          code=src.read_text(encoding='utf-8')
+          original='pd.to_datetime(eligible.expiry_utc,utc=True)'
+          assert code.count(original)==1, 'Unexpected source version; stop instead of unsafe patch'
+          code=code.replace(original,"pd.to_datetime(eligible.expiry_utc,utc=True,format='ISO8601')")
+          src.write_text(code,encoding='utf-8')
+          print('Patched mixed ISO8601 expiry timestamp handling')
+          test=Path('project/tests/test_order_flow.py')
+          test.write_text(test.read_text(encoding='utf-8')+'''
+          def test_mixed_iso8601_expiry_regression():
+              from src.order_flow import audited_splits
+              import pandas as pd
+              z=pd.Timestamp('2026-10-01T00:00:00Z')
+              events=[]
+              for i in range(40):
+                  t=z+pd.Timedelta(minutes=i)
+                  expiry=t+pd.Timedelta(seconds=301)
+                  iso=expiry.isoformat() if i%2 else expiry.isoformat().replace('+00:00','.123456+00:00')
+                  events.append({'model_name':'test','decision_utc':t.isoformat(),
+                       'expiry_utc':iso,'status':'PROXY_ONLY','proxy_result':'WIN',
+                       'net_return_per_unit':0.8})
+              result=audited_splits(pd.DataFrame(events),0.8)
+              assert len(result['results'])==3
+              assert sum(s['valid_proxy_trades'] for s in result['results'])>0
+          ''', encoding='utf-8')
+          PYTHON
+      - name: Install dependencies
+        run: python -m pip install -r project/requirements.txt
+      - name: Run full test suite, including mixed-time regression
+        working-directory: project
+        run: python -m pytest -q
+      - name: Download official Binance aggTrades with checksum validation
+        working-directory: project
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m src.binance_history --symbol "$SYMBOL" --kind aggTrades --day "$DAY" --out data/orderflow
+      - name: Compute order flow and auditable 300-second proxy outcomes
+        working-directory: project
+        shell: bash
+        run: |
+          set -euo pipefail
+          TICK_SIZE=$(python - <<'PYTHON'
+          import os
+          from src.binance_public import PublicClient
+          symbol=os.environ['SYMBOL'].strip().upper()
+          meta=PublicClient().get('/api/v3/exchangeInfo',symbol=symbol)
+          assert len(meta['symbols'])==1 and meta['symbols'][0]['symbol']==symbol
+          assert meta['symbols'][0]['status']=='TRADING'
+          print(next(f['tickSize'] for f in meta['symbols'][0]['filters'] if f['filterType']=='PRICE_FILTER'))
+          PYTHON
+          )
+          echo "Tick size from exchangeInfo: $TICK_SIZE"
+          python -m src.order_flow --aggtrades "data/orderflow/${SYMBOL}_aggTrades_${DAY}.csv" --symbol "$SYMBOL" --tick-size "$TICK_SIZE" --out outputs/orderflow
+          cp "data/orderflow/${SYMBOL}_aggTrades_${DAY}.manifest.json" outputs/orderflow/input_archive_manifest.json
+      - name: Upload report and research tables
+        uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: orderflow-fixed-${{ env.SYMBOL }}-${{ env.DAY }}-${{ github.run_id }}
+          path: project/outputs/orderflow/
+          if-no-files-found: error
+          retention-days: 7
