@@ -1,0 +1,285 @@
+# Binary Quant Lab Stage 10 -- immutable, public-data-only Dukascopy integrity probe.
+# Never logs into a broker, never submits orders, never modifies prior research data.
+name: BQL - Stage10 targeted Dukascopy hourly probe
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/bql-stage10-tick-probe.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bql-source-probe-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  source_integrity_probe:
+    name: Acquire 30 selected EURUSD hours, save raw evidence
+    runs-on: ubuntu-latest
+    timeout-minutes: 65
+    steps:
+      - name: Read-only public hourly BI5 fetch with provenance validation
+        id: fetch
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p stage10-output
+          python3 - fetch --out stage10-output <<'PY'
+          """BQL Stage 10: narrowly scoped independent public Dukascopy hourly BI5 probe.
+          
+          Read-only research. Do not fetch brokerage accounts or transmit orders.
+          Remote retrieval is a verification *attempt*, not cryptographic certification
+          by the market-data origin. Never silently rewrite the prior raw archive.
+          """
+          from __future__ import annotations
+          import argparse
+          import csv
+          from datetime import datetime, timezone
+          import hashlib
+          import io
+          import json
+          import lzma
+          from pathlib import Path
+          import re
+          import struct
+          import time
+          import urllib.error
+          import urllib.request
+          import zipfile
+          import math
+          
+          BASE='https://datafeed.dukascopy.com/datafeed/EURUSD'
+          MS=struct.Struct('>IIIff')
+          MAX_DECOMPRESSED=30*1024*1024
+          MAX_COMPRESSED=4*1024*1024
+          SEP2='2026-09-02'
+          MISSING=(('2026-09-07',1),('2026-09-17',7),('2026-09-18',8))
+          CONTROLS=(('2026-09-01',12),('2026-09-04',21),('2026-09-06',19))
+          
+          
+          def sha(data:bytes)->str:return hashlib.sha256(data).hexdigest()
+          
+          def url_for(date:str,hour:int)->str:
+              t=datetime.strptime(date,'%Y-%m-%d')
+              if t.year!=2026 or t.month!=9 or not 0<=hour<=23:
+                  raise ValueError('out-of-scope historical date/hour')
+              return f'{BASE}/2026/08/{t.day:02d}/{hour:02d}h_ticks.bi5'  # zero-indexed month
+          
+          
+          def plan()->list[dict]:
+              entries=[(SEP2,h,'sep02_hourly_comparison') for h in range(24)]
+              entries += [(d,h,'missing_original_hour') for d,h in MISSING]
+              entries += [(d,h,'control_market_hour' if d=='2026-09-01' else 'control_weekend_empty_hour') for d,h in CONTROLS]
+              assert len(entries)==30 and len(set((d,h) for d,h,_ in entries))==30
+              return [dict(date=d,hour=h,reason=reason,url=url_for(d,h)) for d,h,reason in entries]
+          
+          
+          def decode_bi5_hour(data:bytes)->dict:
+              if not data:return {'status':'empty','ticks':0,'occupied_minutes':0}
+              if len(data)>MAX_COMPRESSED:raise ValueError('compressed hour too large')
+              try:
+                  with lzma.LZMAFile(io.BytesIO(data)) as stream:
+                      raw=stream.read(MAX_DECOMPRESSED+1)
+              except (EOFError,OSError,lzma.LZMAError) as e:raise ValueError('invalid LZMA payload') from e
+              if not raw or len(raw)>MAX_DECOMPRESSED or len(raw)%MS.size:
+                  raise ValueError('invalid BI5 uncompressed length')
+              prev=-1;minutes=set()
+              for i in range(0,len(raw),MS.size):
+                  millis,ask,bid,av,bv=MS.unpack_from(raw,i)
+                  if millis>=3600000 or millis<prev or bid<=0 or ask<bid:
+                      raise ValueError('invalid timestamp ordering or bid/ask')
+                  if not (math.isfinite(av) and math.isfinite(bv) and av>=0 and bv>=0):
+                      raise ValueError('invalid quote volume')
+                  prev=millis;minutes.add(millis//60000)
+              return {'status':'valid','ticks':len(raw)//MS.size,'occupied_minutes':len(minutes),
+                      'min_offset_ms':MS.unpack_from(raw,0)[0],
+                      'max_offset_ms':prev}
+          
+          
+          def archive_inventory(raw_zip:Path)->dict:
+              seen=set();out={};empty=[]
+              pattern=re.compile(r'^EURUSD/(202609\d{2})/(\d{2})h_ticks\.bi5$')
+              with zipfile.ZipFile(raw_zip) as z:
+                  listing=z.infolist()
+                  if len(listing)>1000:raise ValueError('archive has too many entries')
+                  for i in listing:
+                      if i.file_size>MAX_COMPRESSED:raise ValueError('archive member too large')
+                      m=pattern.fullmatch(i.filename)
+                      if not m or i.filename in seen or i.is_dir():raise ValueError('unexpected or duplicate raw archive member')
+                      seen.add(i.filename)
+                      d=m.group(1);h=int(m.group(2))
+                      if h>23:raise ValueError('bad hour')
+                      b=z.read(i)
+                      key=f'{d[:4]}-{d[4:6]}-{d[6:]}T{h:02d}:00:00Z'
+                      v=decode_bi5_hour(b)
+                      if v['status']=='empty':empty.append(key)
+                      out[key]=dict(**v,sha256=sha(b),bytes=len(b))
+              return {'archive_sha256':sha(raw_zip.read_bytes()),'hourly':out,
+                      'member_count':len(out),'empty_hour_files':sorted(empty)}
+          
+          
+          def _fetch_one(url:str,opener=urllib.request.urlopen,*,max_attempts:int=4,sleep=time.sleep)->dict:
+              """On 404, empty and timeout: report status; do NOT replace with synthesized bytes."""
+              if not url.startswith(BASE+'/2026/08/') or not re.fullmatch(r'https://datafeed\.dukascopy\.com/datafeed/EURUSD/2026/08/\d{2}/\d{2}h_ticks\.bi5',url):
+                  raise ValueError('URL outside fixed authorized public endpoint')
+              last=''
+              for attempt in range(1,max_attempts+1):
+                  try:
+                      req=urllib.request.Request(url,headers={'User-Agent':'BQLResearchEvidenceProbe/1.0 (public-data-read-only)','Accept':'application/octet-stream'})
+                      with opener(req,timeout=22) as response:
+                          final=response.geturl()
+                          if final!=url:raise ValueError('redirect not permitted for provenance')
+                          content=response.read(MAX_COMPRESSED+1)
+                          if len(content)>MAX_COMPRESSED:raise ValueError('source exceeds hard byte limit')
+                          info=decode_bi5_hour(content)
+                          info.update({'attempts':attempt,'http_status':getattr(response,'status',200),
+                                       'bytes':len(content),'sha256':sha(content),
+                                       'etag':response.headers.get('ETag'),
+                                       'last_modified':response.headers.get('Last-Modified')})
+                          return {'body':content,'meta':info}
+                  except urllib.error.HTTPError as e:
+                      if e.code==404:return {'body':None,'meta':{'status':'not_found','http_status':404,'attempts':attempt}}
+                      last=f'HTTP_{e.code}'
+                      if e.code not in (429,500,502,503,504):break
+                  except (urllib.error.URLError,TimeoutError) as e:
+                      last='network_error_'+type(e).__name__
+                  except (OSError,ValueError) as e:
+                      return {'body':None,'meta':{'status':'invalid_response','attempts':attempt,'error':str(e)[:180]}}
+                  if attempt<max_attempts:sleep(min(12,2**(attempt-1)))
+              return {'body':None,'meta':{'status':'unavailable','attempts':attempt,'error':last}}
+          
+          
+          def run_probe(out_dir:Path,opener=urllib.request.urlopen,sleep=time.sleep)->dict:
+              out_dir.mkdir(parents=True,exist_ok=True)
+              (out_dir/'raw').mkdir(exist_ok=True)
+              rows=[]
+              for entry in plan():
+                  result=_fetch_one(entry['url'],opener,sleep=sleep)
+                  meta={**entry,**result['meta']}
+                  meta['fetched_at_utc']=datetime.now(timezone.utc).isoformat()
+                  body=result['body']
+                  if body is not None and meta['status']=='valid':
+                      name=f"EURUSD_{entry['date']}_{entry['hour']:02d}h_ticks.bi5"
+                      target=out_dir/'raw'/name
+                      # Never overwrite different bytes; ensures audit reproducibility
+                      if target.exists() and sha(target.read_bytes())!=sha(body):
+                          raise ValueError('existing evidence conflict: '+name)
+                      target.write_bytes(body)
+                      meta['artifact_member']='raw/'+name
+                  rows.append(meta)
+              summary={
+                  'schema':'BQL-STAGE10-SOURCE-PROBE-1',
+                  'method':'PUBLIC_DUKASCOPY_DATAFEED_HTTPS_NO_ACCOUNT_ACCESS',
+                  'source_authenticity_cryptographically_signed':False,
+                  'venue_settlement_verified':False,
+                  'raw_original_archive_modified':False,
+                  'requested_hours':len(rows),
+                  'valid_missing_hours':sum(x['status']=='valid' and x['reason']=='missing_original_hour' for x in rows),
+                  'all_missing_hours_retrieved':all(x['status']=='valid' for x in rows if x['reason']=='missing_original_hour'),
+                  'invalid_or_unavailable':sum(x['status'] in ('unavailable','invalid_response','not_found') for x in rows),
+                  'hours':rows,'signal':'WAIT'
+              }
+              (out_dir/'PROBE_RESULTS.json').write_text(json.dumps(summary,ensure_ascii=False,sort_keys=True,indent=2)+'\n')
+              with (out_dir/'PROBE_RESULTS.csv').open('w',newline='') as f:
+                  keys=['date','hour','reason','status','ticks','occupied_minutes','bytes','sha256','http_status','attempts','artifact_member','error']
+                  w=csv.DictWriter(f,fieldnames=keys,extrasaction='ignore');w.writeheader();w.writerows(rows)
+              return summary
+          
+          
+          def compare_probe(archive:Path,probe_dir:Path)->dict:
+              inv=archive_inventory(archive)['hourly']
+              report=json.loads((probe_dir/'PROBE_RESULTS.json').read_text())
+              expected=plan()
+              if report.get('schema')!='BQL-STAGE10-SOURCE-PROBE-1':
+                  raise ValueError('wrong probe schema')
+              rows=report.get('hours')
+              if not isinstance(rows,list) or len(rows)!=len(expected):
+                  raise ValueError('incomplete or unexpected probe plan')
+              changes=[];original_total=0;download_total=0;count_new=0
+              valid_missing=0;sep2_valid=0
+              for entry,exp in zip(rows,expected):
+                  if any(entry.get(k)!=exp[k] for k in ('date','hour','reason','url')):
+                      raise ValueError('probe entry identity/order mismatch')
+                  key=entry['date']+'T'+f"{entry['hour']:02d}:00:00Z"
+                  orig=inv.get(key)
+                  if entry.get('status')!='valid':
+                      changes.append({'utc_hour':key,'status':'remote_'+str(entry.get('status')),
+                                      'reason':entry['reason']})
+                      continue
+                  expected_member=f"raw/EURUSD_{entry['date']}_{entry['hour']:02d}h_ticks.bi5"
+                  if entry.get('artifact_member')!=expected_member:
+                      raise ValueError('unexpected raw evidence path')
+                  stored=probe_dir/expected_member
+                  if stored.is_symlink() or not stored.is_file() or stored.stat().st_size>MAX_COMPRESSED:
+                      raise ValueError('raw evidence missing or invalid')
+                  body=stored.read_bytes()
+                  decoded=decode_bi5_hour(body)
+                  if (decoded['status']!='valid' or sha(body)!=entry.get('sha256') or
+                      len(body)!=entry.get('bytes') or
+                      decoded['ticks']!=entry.get('ticks') or
+                      decoded['occupied_minutes']!=entry.get('occupied_minutes')):
+                      raise ValueError('probe manifest/raw evidence tampering or mismatch')
+                  if entry['reason']=='missing_original_hour':valid_missing+=1
+                  if entry['reason']=='sep02_hourly_comparison':
+                      if orig is None: raise ValueError('Sep2 original hour unexpectedly absent')
+                      sep2_valid+=1;original_total+=orig['ticks'];download_total+=decoded['ticks']
+                  if orig is None:
+                      count_new+=1;status='ORIGINAL_HOUR_ABSENT_REMOTE_VALID'
+                  elif orig['sha256']==sha(body):
+                      status='EXACT_RAW_BYTES_MATCH'
+                  elif orig['ticks']==decoded['ticks']:
+                      status='BYTES_DIFFER_TICK_COUNTS_MATCH'
+                  else:
+                      status='TICK_COUNT_CONFLICT'
+                  changes.append({'utc_hour':key,'reason':entry['reason'],'status':status,
+                                  'original_ticks':None if orig is None else orig['ticks'],
+                                  'retrieved_ticks':decoded['ticks'],
+                                  'original_sha256':None if orig is None else orig['sha256'],
+                                  'retrieved_sha256':sha(body)})
+              if report.get('all_missing_hours_retrieved')!=(valid_missing==3):
+                  raise ValueError('internal probe success claim inconsistent')
+              return {'schema':'BQL-STAGE10-RECONCILIATION-1','original_sha256':sha(archive.read_bytes()),
+                      'sep02_hours_valid':sep2_valid,
+                      'sep02_daily_count_confirmed':sep2_valid==24,
+                      'sep02_original_ticks':original_total if sep2_valid==24 else None,
+                      'sep02_retrieved_ticks':download_total if sep2_valid==24 else None,
+                      'sep02_delta':download_total-original_total if sep2_valid==24 else None,
+                      'absent_hours_with_valid_new_source':count_new,
+                      'all_three_missing_hours_retrieved':valid_missing==3,
+                      'no_mutation_of_original_archive':True,
+                      'changes':changes,'signal':'WAIT'}
+          
+          
+          def main():
+              p=argparse.ArgumentParser(description='Read-only public-data source integrity probe')
+              p.add_argument('mode',choices=('plan','fetch','compare'))
+              p.add_argument('--out',type=Path,default=Path('stage10-output'))
+              p.add_argument('--raw-zip',type=Path)
+              a=p.parse_args();a.out.mkdir(parents=True,exist_ok=True)
+              if a.mode=='plan':
+                  result={'schema':'BQL-STAGE10-PROBE-PLAN-1','rows':plan(),
+                          'fetch_executed':False,'source_claim_verified':False,'signal':'WAIT'}
+              elif a.mode=='fetch':
+                  result=run_probe(a.out)
+              else:
+                  if a.raw_zip is None:raise SystemExit('compare requires --raw-zip')
+                  result=compare_probe(a.raw_zip,a.out)
+              path=a.out/('PLAN.json' if a.mode=='plan' else 'COMPARISON.json' if a.mode=='compare' else 'SUMMARY.json')
+              path.write_text(json.dumps(result,sort_keys=True,indent=2)+'\n')
+              print(json.dumps({k:v for k,v in result.items() if k not in ('hours','rows','changes')},sort_keys=True))
+              if a.mode=='fetch' and not result['all_missing_hours_retrieved']:raise SystemExit(2)
+          
+          if __name__=='__main__':main()
+          PY
+      - name: Preserve raw responses and machine-readable failure report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bql-stage10-public-data-evidence-${{ github.run_id }}
+          path: stage10-output/
+          if-no-files-found: error
+          retention-days: 14
